@@ -9,13 +9,12 @@ st.set_page_config(page_title="CSV Araçları", layout="centered")
 st.title("🧰 CSV Araçları")
 
 st.markdown("""
-Bu uygulama birden fazla CSV işlemini tek yerde toplar.
+Bu uygulama birden fazla CSV/ZIP işlemini tek yerde toplar.
 
 ### Mevcut araçlar
 - **CSV içindeki çift tırnakları kaldır**
 - **Birden fazla CSV dosyasını birleştir**
-
-Daha sonra buna yeni araçlar da eklenebilir.
+- **ZIP içinden CSV çıkar ve ZIP adıyla yeniden adlandır**
 """)
 
 # Büyük alan hatalarını önlemek için
@@ -32,10 +31,11 @@ def safe_decode(data: bytes, encoding: str) -> str:
     return data.decode(encoding, errors="replace").replace("\x00", "")
 
 
-def build_output_zip(results, report_text: str) -> bytes:
+def build_output_zip(results, report_text: str = None) -> bytes:
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("rapor.txt", report_text)
+        if report_text is not None:
+            z.writestr("rapor.txt", report_text)
         for out_name, out_bytes in results:
             z.writestr(out_name, out_bytes)
     out.seek(0)
@@ -79,6 +79,19 @@ def rows_to_bytes(rows, dialect):
     writer = csv.writer(out, dialect)
     writer.writerows(rows)
     return out.getvalue().encode("utf-8")
+
+
+def list_csv_files(zf: zipfile.ZipFile):
+    return [name for name in zf.namelist() if name.lower().endswith(".csv") and not name.endswith("/")]
+
+
+def get_zip_stem(filename: str) -> str:
+    return os.path.splitext(os.path.basename(filename))[0]
+
+
+def read_zip_csv_as_bytes(zf: zipfile.ZipFile, member_name: str) -> bytes:
+    with zf.open(member_name) as f:
+        return f.read()
 
 
 # =========================================================
@@ -132,13 +145,13 @@ def render_remove_quotes_page():
     st.header('🧹 CSV içindeki " karakterlerini kaldır')
 
     st.markdown("""
-    Bu araç yüklediğin CSV dosyalarının (veya CSV içeren bir ZIP'in) içindeki
-    **çift tırnak** (`"`) karakterlerini hücrelerden siler.
+Bu araç yüklediğin CSV dosyalarının (veya CSV içeren bir ZIP'in) içindeki
+**çift tırnak** (`"`) karakterlerini hücrelerden siler.
 
-    - Değişiklik olan dosyalar: `modified_<orijinal_ad>.csv`
-    - Değişiklik olmayanlar raporda listelenir
-    - Sonuçlar tek bir ZIP olarak indirilebilir
-    """)
+- Değişiklik olan dosyalar: `modified_<orijinal_ad>.csv`
+- Değişiklik olmayanlar raporda listelenir
+- Sonuçlar tek bir ZIP olarak indirilebilir
+""")
 
     source_mode = st.radio(
         "Girdi türü",
@@ -280,7 +293,7 @@ def render_remove_quotes_page():
                         data=b,
                         file_name=os.path.basename(name),
                         mime="text/csv",
-                        key=f"dl_{name}"
+                        key=f"dl_remove_quotes_{name}"
                     )
 
 
@@ -479,6 +492,118 @@ def render_merge_csv_page():
 
 
 # =========================================================
+# 3) ZIP İÇİNDEN CSV ÇIKAR VE ZIP ADIYLA YENİDEN ADLANDIR
+# =========================================================
+def render_extract_csv_from_zip_page():
+    st.header("📦 ZIP içinden CSV çıkarma")
+
+    st.write("""
+Bu araç yüklediğin ZIP dosyalarının içinden `.csv` dosyalarını bulur.
+Varsayılan davranış: ZIP içindeki ilk CSV alınır ve ZIP adıyla yeniden adlandırılır.
+""")
+
+    mode = st.radio(
+        "ZIP içinde birden fazla CSV varsa ne yapalım?",
+        ["İlk CSV'yi al (önerilen)", "CSV seçtir"],
+        horizontal=True,
+        key="extract_mode"
+    )
+
+    uploaded_zips = st.file_uploader(
+        "ZIP dosyalarını yükle (çoklu seçebilirsin)",
+        type=["zip"],
+        accept_multiple_files=True,
+        key="extract_zip_uploader"
+    )
+
+    if uploaded_zips:
+        st.success(f"{len(uploaded_zips)} ZIP yüklendi.")
+
+        output_zip_buffer = io.BytesIO()
+        any_output = False
+        report_lines = []
+        report_lines.append("ZIP İçinden CSV Çıkarma Raporu")
+        report_lines.append("=" * 35)
+
+        with zipfile.ZipFile(output_zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
+            for up in uploaded_zips:
+                zip_name = up.name
+                zip_stem = get_zip_stem(zip_name)
+
+                st.subheader(f"🗂 {zip_name}")
+
+                zip_bytes = io.BytesIO(up.read())
+
+                try:
+                    with zipfile.ZipFile(zip_bytes, "r") as zf:
+                        csv_members = list_csv_files(zf)
+
+                        if not csv_members:
+                            st.warning("Bu ZIP içinde CSV bulunamadı.")
+                            report_lines.append(f"{zip_name}: CSV bulunamadı")
+                            continue
+
+                        if mode == "İlk CSV'yi al (önerilen)":
+                            chosen_member = csv_members[0]
+                            st.caption(f"Seçilen CSV: `{chosen_member}` (ilk bulunan)")
+                        else:
+                            chosen_member = st.selectbox(
+                                f"{zip_name} için bir CSV seç",
+                                csv_members,
+                                key=f"select_{zip_name}"
+                            )
+
+                        csv_bytes = read_zip_csv_as_bytes(zf, chosen_member)
+                        new_csv_name = f"{zip_stem}.csv"
+
+                        st.download_button(
+                            label=f"⬇️ {new_csv_name} indir",
+                            data=csv_bytes,
+                            file_name=new_csv_name,
+                            mime="text/csv",
+                            key=f"dl_extract_{zip_name}"
+                        )
+
+                        out_zip.writestr(new_csv_name, csv_bytes)
+                        any_output = True
+                        report_lines.append(f"{zip_name}: {chosen_member} -> {new_csv_name}")
+
+                except zipfile.BadZipFile:
+                    st.error("Bu dosya geçerli bir ZIP değil veya bozuk.")
+                    report_lines.append(f"{zip_name}: Geçersiz/bozuk ZIP")
+                except Exception as e:
+                    st.error(f"Hata: {e}")
+                    report_lines.append(f"{zip_name}: Hata - {e}")
+
+        if any_output:
+            report_text = "\n".join(report_lines)
+            output_zip_buffer.seek(0)
+
+            final_zip = io.BytesIO()
+            with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                z.writestr("rapor.txt", report_text)
+
+                with zipfile.ZipFile(io.BytesIO(output_zip_buffer.getvalue()), "r") as temp_zip:
+                    for name in temp_zip.namelist():
+                        z.writestr(name, temp_zip.read(name))
+
+            final_zip.seek(0)
+
+            st.divider()
+            st.download_button(
+                "📥 Hepsini tek ZIP olarak indir",
+                data=final_zip.getvalue(),
+                file_name="cikarilan_csvler.zip",
+                mime="application/zip"
+            )
+
+            with st.expander("Raporu Görüntüle"):
+                st.text(report_text)
+    else:
+        st.info("Başlamak için ZIP dosyalarını yükle.")
+
+
+# =========================================================
 # ANA MENÜ
 # =========================================================
 tool = st.selectbox(
@@ -486,6 +611,7 @@ tool = st.selectbox(
     [
         "CSV içindeki çift tırnakları kaldır",
         "CSV dosyalarını birleştir",
+        "ZIP içinden CSV çıkar ve ZIP adıyla yeniden adlandır",
     ]
 )
 
@@ -494,3 +620,6 @@ if tool == "CSV içindeki çift tırnakları kaldır":
 
 elif tool == "CSV dosyalarını birleştir":
     render_merge_csv_page()
+
+elif tool == "ZIP içinden CSV çıkar ve ZIP adıyla yeniden adlandır":
+    render_extract_csv_from_zip_page()
